@@ -1,215 +1,207 @@
 #include <iostream>
 #include <queue>
 #include <thread>
+#include <shared_mutex>
 #include <vector>
 #include <functional>
-#include <mutex>
-#include <condition_variable>
 #include <atomic>
-#include <chrono>
 #include <random>
+#include <chrono>
 #include <map>
 #include <limits>
+#include <mutex>
+#include <condition_variable>
 
-using namespace std::chrono;
+using namespace std;
+using read_write_lock = shared_mutex;
+using read_lock = shared_lock<read_write_lock>;
+using write_lock = unique_lock<read_write_lock>;
+mutex output_mutex;
 
-class TaskQueue {
+template <typename task_type_t>
+class task_queue {
+    using task_queue_impl = queue<task_type_t>;
 public:
-    TaskQueue() = default;
-    ~TaskQueue() { clear(); }
-
+    task_queue() = default;
+    ~task_queue() { clear(); }
     bool empty() const {
-        std::lock_guard<std::mutex> lock(mtx);
-        return tasks.empty();
+        read_lock _(m_rw_lock);
+        return m_tasks.empty();
     }
-
     size_t size() const {
-        std::lock_guard<std::mutex> lock(mtx);
-        return tasks.size();
+        read_lock _(m_rw_lock);
+        return m_tasks.size();
     }
-
     void clear() {
-        std::lock_guard<std::mutex> lock(mtx);
-        while (!tasks.empty()) tasks.pop();
+        write_lock _(m_rw_lock);
+        while (!m_tasks.empty()) m_tasks.pop();
     }
-
-    bool pop(std::function<void()>& task, int& id) {
-        std::lock_guard<std::mutex> lock(mtx);
-        if (tasks.empty()) return false;
-        task = std::move(tasks.front().second);
-        id = tasks.front().first;
-        tasks.pop();
+    bool pop(task_type_t& task) {
+        write_lock _(m_rw_lock);
+        if (m_tasks.empty())
+            return false;
+        task = std::move(m_tasks.front());
+        m_tasks.pop();
         return true;
     }
-
-    void push(int id, std::function<void()> task) {
-        std::lock_guard<std::mutex> lock(mtx);
-        tasks.push({id, task});
+    template <typename... arguments>
+    void emplace(arguments&&... params) {
+        write_lock _(m_rw_lock);
+        m_tasks.emplace(std::forward<arguments>(params)...);
     }
-
 private:
-    std::queue<std::pair<int, std::function<void()>>> tasks;
-    mutable std::mutex mtx;
+    mutable read_write_lock m_rw_lock;
+    task_queue_impl m_tasks;
 };
 
-class ThreadPool {
+struct Task {
+    function<void()> func;
+    int duration;
+    size_t id;
+};
+
+class thread_pool {
 public:
-    ThreadPool() {
+    thread_pool() {
         for (int i = 0; i < 2; ++i) {
-            workers1.emplace_back(&ThreadPool::workerFunction, this, std::ref(queue1), std::ref(total_time1));
-            workers2.emplace_back(&ThreadPool::workerFunction, this, std::ref(queue2), std::ref(total_time2));
+            m_workers1.emplace_back(&thread_pool::worker, this, ref(m_queue1), ref(m_sum_time1), ref(m_queue1_stats));
+            m_workers2.emplace_back(&thread_pool::worker, this, ref(m_queue2), ref(m_sum_time2), ref(m_queue2_stats));
         }
     }
-
-    ~ThreadPool() {
+    ~thread_pool() {
         terminate();
-        printStatistics();
+        print_statistics();
     }
-
-    void addTask(std::function<void()> task, int duration) {
-        std::lock_guard<std::mutex> lock(mtx);
-
-        int task_id = nextTaskId++;
-        enqueue_times[task_id] = high_resolution_clock::now();
-
-        // Наприклад, нехай max total_time на чергу = 60
-        if (total_time1.load() <= total_time2.load()) {
-            if (total_time1.load() + duration > 60) {
-                ++rejected_tasks;
-                return;
-            }
-            queue1.push(task_id, task);
-            total_time1 += duration;
-        } else {
-            if (total_time2.load() + duration > 60) {
-                ++rejected_tasks;
-                return;
-            }
-            queue2.push(task_id, task);
-            total_time2 += duration;
-        }
-
-        cv.notify_one();
-    }
-
-    void terminate() {
+    void add_task(function<void()> func, int duration) {
+        size_t id = m_next_id++;
         {
-            std::lock_guard<std::mutex> lock(mtx);
-            if (stop) return;
-            stop = true;
+            lock_guard<mutex> lock(m_stat_mtx);
+            m_enqueue_time[id] = chrono::high_resolution_clock::now();
         }
-        cv.notify_all();
-
-        for (auto& w : workers1) {
-            if (w.joinable()) w.join();
-        }
-        for (auto& w : workers2) {
-            if (w.joinable()) w.join();
-        }
-    }
-
-private:
-    std::vector<std::thread> workers1;
-    std::vector<std::thread> workers2;
-
-    TaskQueue queue1;
-    TaskQueue queue2;
-
-    std::atomic<int> total_time1{0};
-    std::atomic<int> total_time2{0};
-
-    std::atomic<int> rejected_tasks{0};
-    std::mutex mtx;
-    std::condition_variable cv;
-    std::atomic<bool> stop{false};
-
-    std::atomic<int> nextTaskId{0};
-
-    std::map<int, high_resolution_clock::time_point> enqueue_times;
-    std::mutex stats_mtx;
-
-    double min_wait_time = std::numeric_limits<double>::max();
-    double max_wait_time = 0;
-    double total_wait_time = 0;
-    int completed_tasks = 0;
-
-    void workerFunction(TaskQueue& queue, std::atomic<int>& totalTime) {
-        while (true) {
-            std::function<void()> task;
-            int task_id;
-            {
-                std::unique_lock<std::mutex> lock(mtx);
-                cv.wait(lock, [this, &queue] { return stop || !queue.empty(); });
-
-                if (stop && queue.empty()) break;
-
-                if (!queue.pop(task, task_id)) continue;
-            }
-
-            auto now = high_resolution_clock::now();
-            double wait_time = duration<double>(now - enqueue_times[task_id]).count();
-
-            {
-                std::lock_guard<std::mutex> lock(stats_mtx);
-                if (wait_time < min_wait_time) min_wait_time = wait_time;
-                if (wait_time > max_wait_time) max_wait_time = wait_time;
-                total_wait_time += wait_time;
-                ++completed_tasks;
-            }
-
-            auto start = high_resolution_clock::now();
-            task();
-            auto end = high_resolution_clock::now();
-
-            int duration_secs = duration_cast<seconds>(end - start).count();
-            totalTime -= duration_secs;
-        }
-    }
-
-    void printStatistics() {
-        std::lock_guard<std::mutex> lock(stats_mtx);
-        std::cout << "\n====== Статистика ======\n";
-        std::cout << "Відхилено задач: " << rejected_tasks << "\n";
-        std::cout << "Виконано задач: " << completed_tasks << "\n";
-        if (completed_tasks > 0) {
-            std::cout << "Мінімальний час очікування: " << min_wait_time << " сек\n";
-            std::cout << "Максимальний час очікування: " << max_wait_time << " сек\n";
-            std::cout << "Середній час очікування: " << (total_wait_time / completed_tasks) << " сек\n";
+        if (m_sum_time1.load() <= m_sum_time2.load()) {
+            m_queue1.emplace(Task{func, duration, id});
+            m_sum_time1 += duration;
         } else {
-            std::cout << "Жодної задачі не виконано.\n";
+            m_queue2.emplace(Task{func, duration, id});
+            m_sum_time2 += duration;
         }
-        std::cout << "========================\n";
+        m_queue_cv.notify_all();
     }
+    void terminate() {
+        m_terminate = true;
+        m_queue_cv.notify_all();
+        for (auto& w : m_workers1)
+            if (w.joinable()) w.join();
+        for (auto& w : m_workers2)
+            if (w.joinable()) w.join();
+    }
+    void print_statistics() const {
+        cout << "\n====== Статистика ======\n";
+        cout << "Кількість створених потоків: " << (m_workers1.size() + m_workers2.size()) << endl;
+        cout << "Виконано задач: " << m_completed << endl;
+        cout << "Середній час знаходження воркера у стані очікування: ";
+        if (m_wait_samples > 0) cout << (m_total_wait_worker / m_wait_samples) << " сек\n";
+        else cout << "н/д\n";
+        cout << "Середній час виконання задачі: ";
+        if (m_completed > 0) cout << (m_total_exec_time / m_completed) << " сек\n";
+        else cout << "н/д\n";
+        cout << "Середня довжина черги 1: ";
+        if (m_queue1_stats.samples > 0) cout << (double)m_queue1_stats.sum_len / m_queue1_stats.samples << endl;
+        else cout << "н/д\n";
+        cout << "Середня довжина черги 2: ";
+        if (m_queue2_stats.samples > 0) cout << (double)m_queue2_stats.sum_len / m_queue2_stats.samples << endl;
+        else cout << "н/д\n";
+        cout << "========================\n";
+    }
+private:
+    struct QueueStats {
+        atomic<size_t> sum_len{0};
+        atomic<size_t> samples{0};
+    };
+    void worker(task_queue<Task>& queue, atomic<int>& sum_time, QueueStats& stats) {
+        using namespace chrono;
+        while (!m_terminate.load()) {
+            Task task;
+            stats.sum_len += queue.size();
+            stats.samples++;
+            {
+                unique_lock<mutex> lock(m_queue_mtx);
+                m_queue_cv.wait(lock, [this, &queue] {
+                    return m_terminate || !queue.empty();
+                });
+                if (m_terminate) return;
+                if (!queue.pop(task)) continue;
+            }
+            auto exec_start = high_resolution_clock::now();
+            double task_queue_wait = 0;
+            {
+                lock_guard<mutex> lock(m_stat_mtx);
+                task_queue_wait = duration<double>(exec_start - m_enqueue_time[task.id]).count();
+                m_total_wait_task += task_queue_wait;
+            }
+            auto t_start = high_resolution_clock::now();
+            task.func();
+            auto t_end = high_resolution_clock::now();
+            double exec_secs = duration<double>(t_end - t_start).count();
+            {
+                lock_guard<mutex> lock(m_stat_mtx);
+                m_total_exec_time += exec_secs;
+                m_completed++;
+            }
+            sum_time -= task.duration;
+        }
+    }
+    vector<thread> m_workers1;
+    vector<thread> m_workers2;
+    task_queue<Task> m_queue1;
+    task_queue<Task> m_queue2;
+    atomic<int> m_sum_time1{0};
+    atomic<int> m_sum_time2{0};
+    atomic<bool> m_terminate{false};
+    atomic<size_t> m_next_id{0};
+    condition_variable_any m_queue_cv;
+    mutable mutex m_queue_mtx;
+    atomic<int> m_completed{0};
+    mutable mutex m_stat_mtx;
+    map<size_t, chrono::high_resolution_clock::time_point> m_enqueue_time;
+    double m_total_wait_worker = 0;
+    size_t m_wait_samples = 0;
+    double m_total_exec_time = 0;
+    double m_total_wait_task = 0;
+    QueueStats m_queue1_stats;
+    QueueStats m_queue2_stats;
 };
 
-void generateRandomTask(ThreadPool& pool) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> distr(2, 15);
-
+void generate_task(thread_pool& pool) {
+    static random_device rd;
+    static mt19937 gen(rd());
+    static uniform_int_distribution<> distr(2, 15);
     int duration = distr(gen);
-    pool.addTask([duration]() {
-        std::cout << "Task started, duration: " << duration << " seconds\n";
-        std::this_thread::sleep_for(std::chrono::seconds(duration));
-        std::cout << "Task completed, duration: " << duration << " seconds\n";
+    pool.add_task([duration]() { 
+      {
+        lock_guard<mutex> lock(output_mutex);
+        cout << "Task started (" << duration << " s)\n";
+      }
+      this_thread::sleep_for(chrono::seconds(duration));
+      {
+        lock_guard<mutex> lock(output_mutex);
+        cout << "Task finished (" << duration << " s)\n";
+      }
     }, duration);
 }
 
 int main() {
-    ThreadPool pool;
-
-    std::vector<std::thread> taskGenerators;
+    thread_pool pool;
+    vector<thread> generators;
     for (int i = 0; i < 5; ++i) {
-        taskGenerators.emplace_back([&pool]() {
+        generators.emplace_back([&pool]() {
             for (int j = 0; j < 10; ++j) {
-                generateRandomTask(pool);
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                generate_task(pool);
+                this_thread::sleep_for(chrono::milliseconds(500));
             }
         });
     }
-
-    for (auto& t : taskGenerators) t.join();
-
-    std::this_thread::sleep_for(std::chrono::seconds(10));
+    for (auto& t : generators) t.join();
+    this_thread::sleep_for(chrono::seconds(20));
     return 0;
 }
